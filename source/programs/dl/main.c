@@ -16,7 +16,7 @@
 #include <kernel/ke_srv.h>
 
 #include "sys/ke_req.h"
-#include "../../libs/elf2/internal.h"
+
 #include "../../libs/elf2/elf.h"
 
 /************************************************************************/
@@ -34,6 +34,11 @@ struct dependency_list
 	struct dependency_list * next;
 };
 
+struct elf_context
+{
+	char data[512];
+};
+
 struct exe_objects 
 {
 	xstring name;
@@ -43,7 +48,7 @@ struct exe_objects
 	unsigned long handle;
 	struct dependency_list* d_list;
 };
-
+#define DBG_PREFIX "DL装载器："
 #define ELF_MAX_STATIC_DL_IMAGE_INFO 512
 static struct exe_objects static_elf[ELF_MAX_STATIC_DL_IMAGE_INFO] = {(void*)1};
 static char static_usage[ELF_MAX_STATIC_DL_IMAGE_INFO] = {1};
@@ -51,8 +56,44 @@ static struct dependency_list static_d_list[ELF_MAX_STATIC_DL_IMAGE_INFO] = {(vo
 static char static_d_list_usage[ELF_MAX_STATIC_DL_IMAGE_INFO] = {1};
 
 /* 命令行传递 */
-static char cmdline_buffer[SYSREQ_PROCESS_STARTUP_MAX_SIZE] = {' '};
-static char * exe_split_point = "分割空隙";
+static xchar cmdline_buffer[SYSREQ_PROCESS_STARTUP_MAX_SIZE] = {' '};
+static char *exe_split_point = "分割空隙";
+
+static void *_map_exe_file(xstring name, int *size)
+{
+	void *base;
+	struct sysreq_process_ld req = {0};
+
+	req.base.req_id		= SYS_REQ_KERNEL_PROCESS_HANDLE_EXE;
+	req.name			= name;
+	req.function_type	= SYSREQ_PROCESS_MAP_EXE_FILE;
+	base = (void*)system_call(&req);
+	
+	*size = req.context_length;
+	return (void*)req.map_base;
+}
+
+static void _unmap_exe_file(void *base)
+{
+	struct sysreq_process_ld req = {0};
+	
+	req.base.req_id		= SYS_REQ_KERNEL_PROCESS_HANDLE_EXE;
+	req.name			= base;
+	req.function_type	= SYSREQ_PROCESS_UNMAP_EXE_FILE;
+	system_call(&req);
+}
+
+static bool _inject_exe_object(xstring name, void *ctx, int ctx_size)
+{
+	struct sysreq_process_ld req = {0};
+	
+	req.base.req_id		= SYS_REQ_KERNEL_PROCESS_HANDLE_EXE;
+	req.name			= name;
+	req.context			= ctx;
+	req.context_length	= ctx_size;
+	req.function_type	= SYSREQ_PROCESS_ENJECT_EXE;
+	return system_call(&req);
+}
 
 /**
 	@brief print the string without libc
@@ -167,27 +208,60 @@ static void add_obj_to_dependency_list(struct exe_objects * dependency, struct e
 }
 
 /**
-	@brief Call the kernel to load an image and return its handle 
+	@brief 如果可执行文件曾经被装在过，则直接用历史的，否则新装载
+ 
+	@note
+		name 必须是文件的绝对路径
 */
-static unsigned long load(char * name, struct exe_objects * obj)
+static unsigned long load(xstring name, struct exe_objects * obj)
 {
 	struct sysreq_process_ld req = {0};
-	unsigned long image_handle;
-#if 0
-	req.base.req_id		= SYS_REQ_KERNEL_PROCESS_LD;
+	ke_handle image_handle;
+	int new_loaded = 0;
+	
+open_again:
+	req.base.req_id		= SYS_REQ_KERNEL_PROCESS_HANDLE_EXE;
 	req.name			= name;
 	req.context			= &obj->exe_desc;
-	req.context_length	= sizeof(obj->exe_desc);
-	req.function_type	= SYSREQ_PROCESS_LD_OPEN;
+	req.context_length	= elf_get_private_size();
+	req.function_type	= SYSREQ_PROCESS_OPEN_EXE;
 	image_handle = system_call(&req);
-
-	/* Fill the user context data structure */
 	obj->user_ctx.base = req.map_base;
-#endif
+
+	if (image_handle != KE_INVALID_HANDLE)
+	{
+	
+	}
+	else if (new_loaded == 0)
+	{
+		int file_size;
+		void *entry_address;
+		void *file;
+		
+		file = _map_exe_file(name, &file_size);
+		if (!file)
+			goto end1;
+		if (elf_analyze(file, file_size, &entry_address, &obj->exe_desc) == false)
+			goto end1;
+		if (_inject_exe_object(name, &obj->exe_desc, elf_get_private_size()) == false)
+			goto end1;
+		
+		new_loaded = 1;
+		
+end1:
+		_unmap_exe_file(file);
+		if (new_loaded == 1)
+			goto open_again;
+		goto err;
+	}
+	
 	return image_handle;
+	
+err:
+	return KE_INVALID_HANDLE;
 }
 
-static struct exe_objects * load_image(char * name)
+static struct exe_objects * load_image(xstring name)
 {
 	struct exe_objects * p;
 
@@ -311,7 +385,6 @@ unsigned long lazy_get_symbole_by_id(unsigned long mode_base, int relocate_id)
 	struct elf_context * p = (struct elf_context *)mode_base;
 	struct exe_objects * object = container_of(p, struct exe_objects, exe_desc);
 
-	
 // 	early_print("lazy_get_symbole_by_id, base: ");
 // 	str[elf2_h2c(str, mode_base)] = 0;
 // 	early_print(str);
@@ -399,14 +472,18 @@ static int startup()
 /**
 	@brief 装载制定文件，并且启动main函数
  */
-static int dl_build_image_context(char *first_name)
+static int dl_build_image_context(xstring first_name)
 {
 	struct exe_objects * p;
 
 	/* Load the first image which normally is an EXE */
 	p = load_image(first_name);
-	if (!p) return ENOENT;
-
+	if (!p)
+	{
+		early_print(DBG_PREFIX"装载可执行文件失败.\n");
+		return ENOENT;
+	}
+	
 	early_print("Loading dependency...\n");
 	load_dependencies();
 
@@ -458,10 +535,9 @@ bool __weak ki_get_symbol(struct elf_context * elf, xstring name, unsigned long 
 void dl_dynamic_linker()
 {
 	struct sysreq_process_startup st;
-	char *exe_name;
+	xstring exe_name;
 	int ret;
 
-	early_print("dl_dynamic_linker up...\n");
 	/* 
 		Get the cmd line, 
 		其中包括了绝对路径（必须的，否则没办法判断用户程序的启动路径），
